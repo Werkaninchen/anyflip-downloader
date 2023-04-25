@@ -15,6 +15,7 @@ import (
 
 	"github.com/br3w0r/goitopdf/itopdf"
 	"github.com/schollz/progressbar/v3"
+	"golang.org/x/exp/slices"
 )
 
 func main() {
@@ -32,7 +33,7 @@ func main() {
 	outputFile := path.Base(anyflipURL.String()) + ".pdf"
 
 	// parse --extract_title to automatically rename pdf to it's title from anyflip
-	if len(os.Args) > 2 && os.Args[2] == "--extract_title" {
+	if len(os.Args) > 2 && slices.Contains(os.Args, "--extract_title") {
 		outputFile, err = getBookTitle(anyflipURL)
 		if err != nil {
 			log.Fatal(err)
