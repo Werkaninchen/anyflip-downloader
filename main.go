@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -16,18 +17,17 @@ import (
 
 	"github.com/br3w0r/goitopdf/itopdf"
 	"github.com/schollz/progressbar/v3"
-	"golang.org/x/exp/slices"
 )
 
 func main() {
 
+	extractTitle := flag.Bool("extrectTitle", true, "used to decide if legacy naming system is used or title is extracted from anyflip")
+	ocrFlag := flag.Bool("ocr", true, "used to toggle ocr feature")
+	customName := flag.String("customName", "", "used to set output file name, overides extractTitle")
 	anyflipURL, err := url.Parse(os.Args[1])
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	//my pref
-	os.Args = append(os.Args, "--extract_title", "--ocr")
 
 	bookUrlPathElements := strings.Split(anyflipURL.Path, "/")
 	// secect only 1st and 2nd element of url to avoid mobile on online.anyflip urls
@@ -37,20 +37,30 @@ func main() {
 	downloadFolder := path.Base(anyflipURL.String())
 	outputFile := path.Base(anyflipURL.String()) + ".pdf"
 
-	// parse --extract_title to automatically rename pdf to it's title from anyflip
-	if len(os.Args) > 2 && slices.Contains(os.Args, "--extract_title") {
-		var of = ""
-		of, err = getBookTitle(anyflipURL)
+	configjs, err := downloadConfigJSFile(anyflipURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	//use custom name for output
+	if *customName != "" {
+		outputFile = *customName
+	}
+
+	// use --extract_title to automatically rename pdf to it's title from anyflip, default true
+	if *extractTitle && *customName == "" {
+		of, err := getBookTitle(anyflipURL, configjs)
 		if err != nil {
 			log.Fatal(err)
 		}
+		// fallback to old naming
 		if of != "" {
 			outputFile = of + ".pdf"
 		}
 	}
 
 	fmt.Println("Preparing to download")
-	pageCount, err := getPageCount(anyflipURL)
+	pageCount, err := getPageCount(anyflipURL, configjs)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -59,7 +69,7 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Println("Converting to pdf")
-	if len(os.Args) > 2 && slices.Contains(os.Args, "--ocr") {
+	if *ocrFlag {
 		err = createOCRPDF(outputFile, downloadFolder)
 	} else {
 		err = createPDF(outputFile, downloadFolder)
@@ -186,11 +196,7 @@ func downloadImages(url *url.URL, pageCount int, downloadFolder string) error {
 	return nil
 }
 
-func getBookTitle(url *url.URL) (string, error) {
-	configjs, err := downloadConfigJSFile(url)
-	if err != nil {
-		return url.String(), err
-	}
+func getBookTitle(url *url.URL, configjs string) (string, error) {
 	r := regexp.MustCompile("\"?(bookConfig\\.)?bookTitle\"?=\"(.*?)\"")
 
 	match := r.FindString(configjs)
@@ -201,18 +207,15 @@ func getBookTitle(url *url.URL) (string, error) {
 	// fmt.Println(configjs)
 	match = r.FindString(configjs)
 	if match == "" {
-		return url.String(), err
+		return url.String(), errors.New("no title found")
 	}
 
 	match = match[22 : len(match)-1]
 	return match, nil
 }
 
-func getPageCount(url *url.URL) (int, error) {
-	configjs, err := downloadConfigJSFile(url)
-	if err != nil {
-		return 0, err
-	}
+func getPageCount(url *url.URL, configjs string) (int, error) {
+
 	r := regexp.MustCompile("\"?(bookConfig\\.)?totalPageCount\"?[=:]\"?\\d+\"?")
 	match := r.FindString(configjs)
 	if strings.Contains(match, "=") {
