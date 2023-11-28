@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,77 +13,198 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/asaskevich/govalidator"
 	"github.com/br3w0r/goitopdf/itopdf"
 	"github.com/schollz/progressbar/v3"
 )
 
+var title string
+var tempDownloadFolder string
+var insecure bool
+var ocr bool
+
+type flipbook struct {
+	URL       *url.URL
+	title     string
+	pageCount int
+	pageURLs  []string
+}
+
+func init() {
+	flag.StringVar(&tempDownloadFolder, "temp-download-folder", "", "Specifies the name of the temporary download folder")
+	flag.StringVar(&title, "title", "", "Specifies the name of the generated PDF document (uses book title if not specified)")
+	flag.BoolVar(&insecure, "insecure", false, "Skip certificate validation")
+	flag.BoolVar(&ocr, "ocr", true, "used to toggle ocr feature")
+}
+
 func main() {
-
-	extractTitle := flag.Bool("extrectTitle", true, "used to decide if legacy naming system is used or title is extracted from anyflip")
-	ocrFlag := flag.Bool("ocr", true, "used to toggle ocr feature")
-	customName := flag.String("customName", "", "used to set output file name, overides extractTitle")
-	anyflipURL, err := url.Parse(os.Args[1])
+	flag.Parse()
+	anyflipURL, err := url.Parse(flag.Args()[0])
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	bookUrlPathElements := strings.Split(anyflipURL.Path, "/")
-	// secect only 1st and 2nd element of url to avoid mobile on online.anyflip urls
-	// as path starts with / offset index by 1
-	anyflipURL.Path = path.Join("/", bookUrlPathElements[1], bookUrlPathElements[2])
-
-	downloadFolder := path.Base(anyflipURL.String())
-	outputFile := downloadFolder + ".pdf"
-
-	configjs, err := downloadConfigJSFile(anyflipURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	//use custom name for output
-	if *customName != "" {
-		outputFile = *customName
-	}
-
-	// use --extract_title to automatically rename pdf to it's title from anyflip, default true
-	if *extractTitle && *customName == "" {
-		of, err := getBookTitle(anyflipURL, configjs)
-		if (err != nil || of != "") && !strings.Contains(of, "://") {
-			outputFile = of + ".pdf"
-		}
+	if insecure {
+		fmt.Println("You enabled insecure downloads. This disables security checks. Stay safe!")
+		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
 	fmt.Println("Preparing to download")
-	pageCount, err := getPageCount(anyflipURL, configjs)
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = downloadImages(anyflipURL, pageCount, downloadFolder)
-
-	if err != nil {
-		// try getting pages by id instead of page number, only encounterd it twice
-		err = downloadImagesFallback(anyflipURL, pageCount, downloadFolder, configjs)
-	}
+	flipbook, err := prepareDownload(anyflipURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	if tempDownloadFolder == "" {
+		tempDownloadFolder = flipbook.title
+	}
+	outputFile := title + ".pdf"
+
+	err = flipbook.downloadImages(tempDownloadFolder)
+	if err != nil {
+		log.Fatal(err)
+	}
 	fmt.Println("Converting to pdf")
-	if *ocrFlag {
-		err = createOCRPDF(outputFile, downloadFolder)
+	if ocr {
+		err = createOCRPDF(outputFile, tempDownloadFolder)
 	} else {
-		err = createPDF(outputFile, downloadFolder)
+		err = createPDF(outputFile, tempDownloadFolder)
 	}
+
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	os.RemoveAll(downloadFolder)
-	os.RemoveAll(downloadFolder + "_pdf")
+	os.RemoveAll(tempDownloadFolder)
+}
+
+func prepareDownload(anyflipURL *url.URL) (*flipbook, error) {
+	var newFlipbook flipbook
+
+	sanitizeURL(anyflipURL)
+	newFlipbook.URL = anyflipURL
+
+	configjs, err := downloadConfigJSFile(anyflipURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if title == "" {
+		title, err = getBookTitle(configjs)
+		if err != nil {
+			title = path.Base(anyflipURL.String())
+		}
+	}
+
+	newFlipbook.title = govalidator.SafeFileName(title)
+	newFlipbook.pageCount, err = getPageCount(configjs)
+	pageFileNames := getPageFileNames(configjs)
+
+	downloadURL, _ := url.Parse("https://online.anyflip.com/")
+	println(newFlipbook.URL.String())
+	if len(pageFileNames) == 0 {
+		for i := 1; i <= newFlipbook.pageCount; i++ {
+			downloadURL.Path = path.Join(newFlipbook.URL.Path, "files", "mobile", strconv.Itoa(i)+".jpg")
+			newFlipbook.pageURLs = append(newFlipbook.pageURLs, downloadURL.String())
+		}
+	} else {
+		for i := 0; i < newFlipbook.pageCount; i++ {
+			downloadURL.Path = path.Join(newFlipbook.URL.Path, "files", "large", pageFileNames[i])
+			newFlipbook.pageURLs = append(newFlipbook.pageURLs, downloadURL.String())
+		}
+	}
+
+	return &newFlipbook, err
+}
+
+func sanitizeURL(anyflipURL *url.URL) {
+	bookURLPathElements := strings.Split(anyflipURL.Path, "/")
+	anyflipURL.Path = path.Join("/", bookURLPathElements[1], bookURLPathElements[2])
+}
+
+func createPDF(outputFile string, imageDir string) error {
+	outputFile = strings.ReplaceAll(outputFile, "'", "")
+	outputFile = strings.ReplaceAll(outputFile, "\\", "")
+	outputFile = strings.ReplaceAll(outputFile, ":", "")
+
+	pdf := itopdf.NewInstance()
+	err := pdf.WalkDir(imageDir, nil)
+	if err != nil {
+		return err
+	}
+	err = pdf.Save(outputFile)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (fb *flipbook) downloadImages(downloadFolder string) error {
+	err := os.Mkdir(downloadFolder, os.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	bar := progressbar.NewOptions(fb.pageCount,
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetDescription("Downloading"),
+	)
+
+	for page := 0; page < fb.pageCount; page++ {
+		downloadURL := fb.pageURLs[page]
+		response, err := http.Get(downloadURL)
+		if err != nil {
+			return err
+		}
+
+		if response.StatusCode != http.StatusOK {
+			println("During download from ", downloadURL)
+			return errors.New("Received non-200 response: " + response.Status)
+		}
+
+		extension := path.Ext(downloadURL)
+		filename := fmt.Sprintf("%04d%v", page, extension)
+		file, err := os.Create(path.Join(downloadFolder, filename))
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(file, response.Body)
+		if err != nil {
+			return err
+		}
+
+		bar.Add(1)
+	}
+	fmt.Println()
+	return nil
+}
+
+func downloadConfigJSFile(bookURL *url.URL) (string, error) {
+	configjsURL, err := url.Parse("https://online.anyflip.com")
+	if err != nil {
+		return "", err
+	}
+	configjsURL.Path = path.Join(bookURL.Path, "mobile", "javascript", "config.js")
+	resp, err := http.Get(configjsURL.String())
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.New("received non-200 response:" + resp.Status)
+	}
+	configjs, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(configjs), nil
 }
 
 // depends on tesseract and qpdf
@@ -132,19 +254,6 @@ func createOCRPDF(outputFile string, imgDir string) error {
 	err = cmd.Run()
 
 	return err
-}
-
-func createPDF(outputFile string, imageDir string) error {
-	pdf := itopdf.NewInstance()
-	err := pdf.WalkDir(imageDir, nil)
-	if err != nil {
-		return err
-	}
-	err = pdf.Save(outputFile)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func downloadImages(url *url.URL, pageCount int, downloadFolder string) error {
@@ -260,60 +369,6 @@ func downloadImagesFallback(url *url.URL, pageCount int, downloadFolder string, 
 	}
 	fmt.Println()
 	return nil
-}
-
-func getBookTitle(url *url.URL, configjs string) (string, error) {
-	r := regexp.MustCompile("\"?(bookConfig\\.)?bookTitle\"?=\"(.*?)\"")
-	offsett := 22
-	match := r.FindString(configjs)
-	if match == "" {
-		offsett = 17
-		r = regexp.MustCompile(`"meta":\{"title":"(.*?)"`)
-	}
-	// fmt.Println(configjs)
-	match = r.FindString(configjs)
-	if match == "" {
-		return url.String(), errors.New("no title found")
-	}
-
-	match = match[offsett : len(match)-1]
-	return match, nil
-}
-
-func getPageCount(url *url.URL, configjs string) (int, error) {
-
-	r := regexp.MustCompile("\"?(bookConfig\\.)?totalPageCount\"?[=:]\"?\\d+\"?")
-	match := r.FindString(configjs)
-	if strings.Contains(match, "=") {
-		match = strings.Split(match, "=")[1]
-	} else if strings.Contains(match, ":") {
-		match = strings.Split(match, ":")[1]
-	} else {
-		return 0, errors.New("could not find page count")
-	}
-	match = strings.ReplaceAll(match, "\"", "")
-	return strconv.Atoi(match)
-}
-
-func downloadConfigJSFile(bookURL *url.URL) (string, error) {
-	configjsURL, err := url.Parse("https://online.anyflip.com")
-	if err != nil {
-		return "", err
-	}
-	configjsURL.Path = path.Join(bookURL.Path, "mobile", "javascript", "config.js")
-	resp, err := http.Get(configjsURL.String())
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", errors.New("received non-200 response:" + resp.Status)
-	}
-	configjs, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(configjs), nil
 }
 
 func parseConfigJSFile(configjs string) (map[string]interface{}, error) {
