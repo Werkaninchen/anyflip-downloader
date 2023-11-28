@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,7 +36,7 @@ func main() {
 	anyflipURL.Path = path.Join("/", bookUrlPathElements[1], bookUrlPathElements[2])
 
 	downloadFolder := path.Base(anyflipURL.String())
-	outputFile := path.Base(anyflipURL.String()) + ".pdf"
+	outputFile := downloadFolder + ".pdf"
 
 	configjs, err := downloadConfigJSFile(anyflipURL)
 	if err != nil {
@@ -50,11 +51,7 @@ func main() {
 	// use --extract_title to automatically rename pdf to it's title from anyflip, default true
 	if *extractTitle && *customName == "" {
 		of, err := getBookTitle(anyflipURL, configjs)
-		if err != nil {
-			log.Fatal(err)
-		}
-		// fallback to old naming
-		if of != "" {
+		if (err != nil || of != "") && !strings.Contains(of, "://") {
 			outputFile = of + ".pdf"
 		}
 	}
@@ -65,9 +62,15 @@ func main() {
 		log.Fatal(err)
 	}
 	err = downloadImages(anyflipURL, pageCount, downloadFolder)
+
+	if err != nil {
+		// try getting pages by id instead of page number, only encounterd it twice
+		err = downloadImagesFallback(anyflipURL, pageCount, downloadFolder, configjs)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	fmt.Println("Converting to pdf")
 	if *ocrFlag {
 		err = createOCRPDF(outputFile, downloadFolder)
@@ -126,13 +129,9 @@ func createOCRPDF(outputFile string, imgDir string) error {
 
 	cmd := exec.Command("qpdf", args...)
 	cmd.Dir = imgDir + "_pdf"
-
 	err = cmd.Run()
-	if err != nil {
-		return err
-	}
 
-	return nil
+	return err
 }
 
 func createPDF(outputFile string, imageDir string) error {
@@ -196,21 +195,88 @@ func downloadImages(url *url.URL, pageCount int, downloadFolder string) error {
 	return nil
 }
 
-func getBookTitle(url *url.URL, configjs string) (string, error) {
-	r := regexp.MustCompile("\"?(bookConfig\\.)?bookTitle\"?=\"(.*?)\"")
+// ugly workaround for newer? uploads using fliphtml5 format
+func downloadImagesFallback(url *url.URL, pageCount int, downloadFolder string, configjs string) error {
 
-	match := r.FindString(configjs)
-	if match == "" {
-		r = regexp.MustCompile(`"meta":\{"title":"(.*?)"`)
+	v, err := parseConfigJSFile(configjs)
+	if err != nil {
+		log.Fatal(err)
 	}
 
+	bar := progressbar.NewOptions(pageCount,
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetDescription("Downloading"),
+	)
+	downloadURL, err := url.Parse("https://online.anyflip.com")
+	if err != nil {
+		return err
+	}
+
+	s, ok := v["fliphtml5_pages"].([]interface{})
+
+	if !ok {
+		return errors.New("error parsing")
+	}
+	for page, p := range s {
+		m, ok := p.(map[string]interface{})
+		if !ok {
+			return errors.New("error parsing")
+		}
+		val, ok := m["n"].([]interface{})
+		if !ok {
+			return errors.New("error parsing")
+		}
+		pageId, ok := val[0].(string)
+		if !ok {
+			return errors.New("error parsing")
+		}
+
+		downloadURL.Path = path.Join(url.Path, "files", "large", pageId)
+		response, err := http.Get(downloadURL.String())
+		if err != nil {
+			return err
+		}
+
+		if response.StatusCode != http.StatusOK {
+			return errors.New("Received non-200 response: " + response.Status)
+		}
+
+		extension := path.Ext(downloadURL.String())
+		filename := fmt.Sprintf("%04d%v", page, extension)
+		file, err := os.Create(path.Join(downloadFolder, filename))
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(file, response.Body)
+		if err != nil {
+			return err
+		}
+
+		bar.Add(1)
+	}
+	fmt.Println()
+	return nil
+}
+
+func getBookTitle(url *url.URL, configjs string) (string, error) {
+	r := regexp.MustCompile("\"?(bookConfig\\.)?bookTitle\"?=\"(.*?)\"")
+	offsett := 22
+	match := r.FindString(configjs)
+	if match == "" {
+		offsett = 17
+		r = regexp.MustCompile(`"meta":\{"title":"(.*?)"`)
+	}
 	// fmt.Println(configjs)
 	match = r.FindString(configjs)
 	if match == "" {
 		return url.String(), errors.New("no title found")
 	}
 
-	match = match[22 : len(match)-1]
+	match = match[offsett : len(match)-1]
 	return match, nil
 }
 
@@ -248,4 +314,12 @@ func downloadConfigJSFile(bookURL *url.URL) (string, error) {
 		return "", err
 	}
 	return string(configjs), nil
+}
+
+func parseConfigJSFile(configjs string) (map[string]interface{}, error) {
+	var v map[string]interface{}
+	// remove js variable notation
+	configjs = configjs[17 : len(configjs)-1]
+	err := json.Unmarshal([]byte(configjs), &v)
+	return v, err
 }
